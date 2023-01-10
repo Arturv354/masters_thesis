@@ -1,0 +1,350 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel GenerateVoxelValues
+#pragma kernel RunMarchinCubes
+#pragma kernel SmoothNormals
+#pragma kernel CreateOutput
+//#pragma kernel CreateOutputExact
+//#pragma kernel CreateOutputAll
+
+#include "ShaderStructures.hlsl"
+#include "MarchingCubeFormula.hlsl"
+#include "FastNoiseLite.hlsl"
+
+#define NO_POLYGON -1
+#define EPSILON 0.00001
+
+float chunkPositionX;
+float chunkPositionY;
+float chunkPositionZ;
+uint normalSmoothRange;
+uint isTopChunk;
+uint isBottomChunk;
+uint chunkMaxVoxelsSide;
+uint chunkVoxelsSideX;
+uint chunkVoxelsSideY;
+uint chunkVoxelsSideZ;
+uint chunkMaxCubesSide;
+uint chunkCubesSideX;
+uint chunkCubesSideY;
+uint chunkCubesSideZ;
+float cubeSize;
+float maxTerrainSize;
+// noise
+int seed;
+uint noiseLayers;
+float noiseFrequency;
+float noiseStrength;
+float noiseLayerFrequencyMultiplier;
+
+RWStructuredBuffer<Voxel> voxelBuffer;
+RWStructuredBuffer<TriangleTmp> triangleTmpBuffer;
+RWStructuredBuffer<Triangle> triangleBuffer;
+AppendStructuredBuffer<Triangle> outputTriangleBuffer;
+//AppendStructuredBuffer<Triangle> outputTriangleBufferExact;
+//RWStructuredBuffer<Triangle> outputTriangleBufferAll;
+
+[numthreads(1024, 1, 1)]
+void GenerateVoxelValues(uint3 id : SV_DispatchThreadID) {
+
+    if (id.x >= chunkMaxVoxelsSide * chunkMaxVoxelsSide * chunkMaxVoxelsSide)
+        return;
+
+    uint x = id.x % chunkMaxVoxelsSide;
+    uint y = (id.x % (chunkMaxVoxelsSide * chunkMaxVoxelsSide)) / chunkMaxVoxelsSide;
+    uint z = id.x / (chunkMaxVoxelsSide * chunkMaxVoxelsSide);
+
+    if (x >= chunkVoxelsSideX || y >= chunkVoxelsSideY || z >= chunkVoxelsSideZ)
+        return;
+
+    float3 chunkStartPosition = -(float3(chunkMaxCubesSide, chunkMaxCubesSide, chunkMaxCubesSide) * cubeSize) / 2;
+    float3 voxelLocalPosition = chunkStartPosition + float3(x, y, z) * cubeSize;
+    voxelBuffer[id.x].position = voxelLocalPosition;
+
+    float densityInputX = (chunkPositionX + voxelLocalPosition.x) / (maxTerrainSize + cubeSize * 2);
+    float densityInputY = (chunkPositionY + voxelLocalPosition.y) / (maxTerrainSize + cubeSize * 2);
+    float densityInputZ = (chunkPositionZ + voxelLocalPosition.z) / (maxTerrainSize + cubeSize * 2);
+
+    float density = -densityInputY;
+
+    fnl_state noise = fnlCreateState();
+    noise.seed = seed;
+    noise.noise_type = FNL_NOISE_PERLIN;
+
+    float noiseValue = 0;
+    for (uint i = 0; i < noiseLayers; i++)
+    {
+        noise.frequency = noiseFrequency * pow(abs(noiseLayerFrequencyMultiplier), i);
+        float currentNoiseStrength = noiseStrength / pow(2, i);
+        noiseValue += fnlGetNoise3D(noise, densityInputX, densityInputY, densityInputZ) * currentNoiseStrength;
+    }
+
+    density += noiseValue;
+
+    // top layer of terrain should always be air and bottom layer should always be under
+    if (isBottomChunk && (y == 0 || y == 1)) density = 1.0;
+    if (isTopChunk && (y == chunkVoxelsSideY - 1 || y == chunkVoxelsSideY - 2)) density = -1.0;
+
+    voxelBuffer[id.x].value = density;
+}
+
+[numthreads(1024, 1, 1)]
+void RunMarchinCubes(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= chunkMaxCubesSide * chunkMaxCubesSide * chunkMaxCubesSide)
+        return;
+
+    uint x = id.x % chunkMaxCubesSide;
+    uint y = (id.x % (chunkMaxCubesSide * chunkMaxCubesSide)) / chunkMaxCubesSide;
+    uint z = id.x / (chunkMaxCubesSide * chunkMaxCubesSide);
+
+    if (x >= chunkCubesSideX || y >= chunkCubesSideY || z >= chunkCubesSideZ)
+        return;
+
+    //  converting formula for cube idx -> vertex idx
+    uint cornerIndexes[8];
+    cornerIndexes[0] = id.x + y + ((2 * chunkMaxVoxelsSide) - 1) * z;
+    cornerIndexes[1] = cornerIndexes[0] + 1;
+    cornerIndexes[2] = cornerIndexes[0] + 1 + chunkMaxVoxelsSide;
+    cornerIndexes[3] = cornerIndexes[0] + chunkMaxVoxelsSide;
+    cornerIndexes[4] = cornerIndexes[0] + chunkMaxVoxelsSide * chunkMaxVoxelsSide;
+    cornerIndexes[5] = cornerIndexes[4] + 1;
+    cornerIndexes[6] = cornerIndexes[4] + 1 + chunkMaxVoxelsSide;
+    cornerIndexes[7] = cornerIndexes[4] + chunkMaxVoxelsSide;
+
+    // voxel values (corner)
+    int cornerInfo = 0;
+    if (voxelBuffer[cornerIndexes[0]].value <= 0) { cornerInfo |= 1; }
+    if (voxelBuffer[cornerIndexes[1]].value <= 0) { cornerInfo |= 2; }
+    if (voxelBuffer[cornerIndexes[2]].value <= 0) { cornerInfo |= 4; }
+    if (voxelBuffer[cornerIndexes[3]].value <= 0) { cornerInfo |= 8; }
+    if (voxelBuffer[cornerIndexes[4]].value <= 0) { cornerInfo |= 16; }
+    if (voxelBuffer[cornerIndexes[5]].value <= 0) { cornerInfo |= 32; }
+    if (voxelBuffer[cornerIndexes[6]].value <= 0) { cornerInfo |= 64; }
+    if (voxelBuffer[cornerIndexes[7]].value <= 0) { cornerInfo |= 128; }
+
+    triangleTmpBuffer[id.x * 5].v1 = 0;
+    triangleTmpBuffer[id.x * 5].v2 = 0;
+    triangleTmpBuffer[id.x * 5].v3 = 0;
+    triangleTmpBuffer[id.x * 5 + 1].v1 = 0;
+    triangleTmpBuffer[id.x * 5 + 1].v2 = 0;
+    triangleTmpBuffer[id.x * 5 + 1].v3 = 0;
+    triangleTmpBuffer[id.x * 5 + 2].v1 = 0;
+    triangleTmpBuffer[id.x * 5 + 2].v2 = 0;
+    triangleTmpBuffer[id.x * 5 + 2].v3 = 0;
+    triangleTmpBuffer[id.x * 5 + 3].v1 = 0;
+    triangleTmpBuffer[id.x * 5 + 3].v2 = 0;
+    triangleTmpBuffer[id.x * 5 + 3].v3 = 0;
+    triangleTmpBuffer[id.x * 5 + 4].v1 = 0;
+    triangleTmpBuffer[id.x * 5 + 4].v2 = 0;
+    triangleTmpBuffer[id.x * 5 + 4].v3 = 0;
+
+    cornerInfo = cornerInfo * 16;
+    int plusIdx = 0;
+    while (LoopUpTable[cornerInfo] != NO_POLYGON)
+    {
+        int edgeInfo[3] =
+        {
+            LoopUpTable[cornerInfo],
+            LoopUpTable[cornerInfo + 1],
+            LoopUpTable[cornerInfo + 2]
+        };
+
+        float3 cornerPos1;
+        float3 cornerPos2;
+        float3 cornerVal1;
+        float3 cornerVal2;
+
+        cornerPos1 = voxelBuffer[cornerIndexes[cornerIndexAFromEdge[edgeInfo[0]]]].position;
+        cornerPos2 = voxelBuffer[cornerIndexes[cornerIndexBFromEdge[edgeInfo[0]]]].position;
+        cornerVal1 = voxelBuffer[cornerIndexes[cornerIndexAFromEdge[edgeInfo[0]]]].value;
+        cornerVal2 = voxelBuffer[cornerIndexes[cornerIndexBFromEdge[edgeInfo[0]]]].value;
+        
+        float3 v1 = cornerPos1 - cornerVal1 * (cornerPos2 - cornerPos1) / (cornerVal2 - cornerVal1);
+
+        cornerPos1 = voxelBuffer[cornerIndexes[cornerIndexAFromEdge[edgeInfo[1]]]].position;
+        cornerPos2 = voxelBuffer[cornerIndexes[cornerIndexBFromEdge[edgeInfo[1]]]].position;
+        cornerVal1 = voxelBuffer[cornerIndexes[cornerIndexAFromEdge[edgeInfo[1]]]].value;
+        cornerVal2 = voxelBuffer[cornerIndexes[cornerIndexBFromEdge[edgeInfo[1]]]].value;
+
+        float3 v2 = cornerPos1 - cornerVal1 * (cornerPos2 - cornerPos1) / (cornerVal2 - cornerVal1);
+
+        cornerPos1 = voxelBuffer[cornerIndexes[cornerIndexAFromEdge[edgeInfo[2]]]].position;
+        cornerPos2 = voxelBuffer[cornerIndexes[cornerIndexBFromEdge[edgeInfo[2]]]].position;
+        cornerVal1 = voxelBuffer[cornerIndexes[cornerIndexAFromEdge[edgeInfo[2]]]].value;
+        cornerVal2 = voxelBuffer[cornerIndexes[cornerIndexBFromEdge[edgeInfo[2]]]].value;
+
+        float3 v3 = cornerPos1 - cornerVal1 * (cornerPos2 - cornerPos1) / (cornerVal2 - cornerVal1);
+
+        triangleTmpBuffer[(id.x * 5) + plusIdx].v1 = v1;
+        triangleTmpBuffer[(id.x * 5) + plusIdx].v2 = v2;
+        triangleTmpBuffer[(id.x * 5) + plusIdx].v3 = v3;
+
+        float3 v12 = (v1 - v2);
+        float3 v23 = (v2 - v3);
+        float3 crossNormal = normalize(cross(v12, v23));
+        
+        triangleTmpBuffer[(id.x * 5) + plusIdx].n = crossNormal;
+
+        ++plusIdx;
+        cornerInfo += 3;
+    }
+}
+
+bool VertexEquals(float3 vert1, float3 vert2)
+{
+    return (abs(vert1.x - vert2.x) < EPSILON && abs(vert1.y - vert2.y) < EPSILON && abs(vert1.z - vert2.z) < EPSILON);
+}
+
+bool ShareVertex(float3 vertex, TriangleTmp triangleStruct)
+{
+    return (VertexEquals(vertex, triangleStruct.v1) || VertexEquals(vertex, triangleStruct.v2) || VertexEquals(vertex, triangleStruct.v3));
+}
+
+[numthreads(1024, 1, 1)]
+void SmoothNormals(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (chunkMaxCubesSide * chunkMaxCubesSide * chunkMaxCubesSide * 5))
+        return;
+
+    // get Cube Idx
+    uint cubeID = id.x / 5;
+    uint cubeX = cubeID % chunkMaxCubesSide;
+    uint cubeY = (cubeID % (chunkMaxCubesSide * chunkMaxCubesSide)) / chunkMaxCubesSide;
+    uint cubeZ = cubeID / (chunkMaxCubesSide * chunkMaxCubesSide);
+
+    if (cubeX == 0 || cubeY == 0 || cubeZ == 0 || cubeX == chunkCubesSideX - 1 || cubeY == chunkCubesSideY - 1 || cubeZ == chunkCubesSideZ - 1)
+        return;
+
+    TriangleTmp thisTriangle = triangleTmpBuffer[id.x];
+    triangleBuffer[id.x].v1 = thisTriangle.v1;
+    triangleBuffer[id.x].v2 = thisTriangle.v2;
+    triangleBuffer[id.x].v3 = thisTriangle.v3;
+    triangleBuffer[id.x].n1 = thisTriangle.n;
+    triangleBuffer[id.x].n2 = thisTriangle.n;
+    triangleBuffer[id.x].n3 = thisTriangle.n;
+
+    if (normalSmoothRange)
+    {
+        float3 vertexNormalsSumV1 = float3(0, 0, 0);
+        int vertexNormalCountV1 = 0;
+        float3 vertexNormalsSumV2 = float3(0, 0, 0);
+        int vertexNormalCountV2 = 0;
+        float3 vertexNormalsSumV3 = float3(0, 0, 0);
+        int vertexNormalCountV3 = 0;
+
+        TriangleTmp nearTriangle;
+        
+        for (uint otherCubeX = cubeX - normalSmoothRange; otherCubeX < cubeX + 1 + normalSmoothRange; otherCubeX++)
+        {
+            for (uint otherCubeY = cubeY - normalSmoothRange; otherCubeY < cubeY + 1 + normalSmoothRange; otherCubeY++)
+            {
+                for (uint otherCubeZ = cubeZ - normalSmoothRange; otherCubeZ < cubeZ + 1 + normalSmoothRange; otherCubeZ++)
+                {
+                    uint otherCubeId = otherCubeZ * chunkMaxCubesSide * chunkMaxCubesSide + otherCubeY * chunkMaxCubesSide + otherCubeX;
+
+                    for (uint nearTriangleIndex = 0; nearTriangleIndex < 5; nearTriangleIndex++)
+                    {
+                        nearTriangle = triangleTmpBuffer[otherCubeId * 5 + nearTriangleIndex];
+
+                        if (ShareVertex(thisTriangle.v1, nearTriangle))
+                        {
+                            vertexNormalsSumV1 += nearTriangle.n;
+                            vertexNormalCountV1 += 1;
+                        }
+                        if (ShareVertex(thisTriangle.v2, nearTriangle))
+                        {
+                            vertexNormalsSumV2 += nearTriangle.n;
+                            vertexNormalCountV2 += 1;
+                        }
+                        if (ShareVertex(thisTriangle.v3, nearTriangle))
+                        {
+                            vertexNormalsSumV3 += nearTriangle.n;
+                            vertexNormalCountV3 += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (vertexNormalCountV1 > 0) triangleBuffer[id.x].n1 = normalize(vertexNormalsSumV1 / vertexNormalCountV1);
+        if (vertexNormalCountV2 > 0) triangleBuffer[id.x].n2 = normalize(vertexNormalsSumV2 / vertexNormalCountV2);
+        if (vertexNormalCountV3 > 0) triangleBuffer[id.x].n3 = normalize(vertexNormalsSumV3 / vertexNormalCountV3);
+    }
+}
+
+
+bool VertexIsZero(float3 vertex)
+{
+    return (
+        vertex.x < EPSILON && vertex.y < EPSILON && vertex.z < EPSILON &&
+        vertex.x > -EPSILON && vertex.y > -EPSILON && vertex.z > -EPSILON
+    );
+}
+
+[numthreads(1024, 1, 1)]
+void CreateOutput(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= chunkMaxCubesSide * chunkMaxCubesSide * chunkMaxCubesSide * 5)
+        return;
+
+    uint cubeID = id.x / 5;
+    uint cubeX = cubeID % chunkMaxCubesSide;
+    uint cubeY = (cubeID % (chunkMaxCubesSide * chunkMaxCubesSide)) / chunkMaxCubesSide;
+    uint cubeZ = cubeID / (chunkMaxCubesSide * chunkMaxCubesSide);
+
+    if (cubeX >= chunkCubesSideX || cubeY >= chunkCubesSideY || cubeZ >= chunkCubesSideZ)
+        return;
+
+    if (cubeX == 0 || cubeY == 0 || cubeZ == 0 || cubeX == chunkCubesSideX - 1 || cubeY == chunkCubesSideY - 1 || cubeZ == chunkCubesSideZ - 1)
+        return;
+
+    Triangle currentTriangle = triangleBuffer[id.x];
+    if (!(VertexIsZero(currentTriangle.v1) && VertexIsZero(currentTriangle.v2) && VertexIsZero(currentTriangle.v3)))
+    {
+        outputTriangleBuffer.Append(currentTriangle);
+    }
+}
+
+/*
+[numthreads(1024, 1, 1)]
+void CreateOutputExact(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= chunkMaxCubesSide * chunkMaxCubesSide * chunkMaxCubesSide * 5)
+        return;
+
+    uint cubeID = id.x / 5;
+    uint cubeX = cubeID % chunkMaxCubesSide;
+    uint cubeY = (cubeID % (chunkMaxCubesSide * chunkMaxCubesSide)) / chunkMaxCubesSide;
+    uint cubeZ = cubeID / (chunkMaxCubesSide * chunkMaxCubesSide);
+
+    if (cubeX >= chunkCubesSideX || cubeY >= chunkCubesSideY || cubeZ >= chunkCubesSideZ)
+        return;
+
+    if (cubeX == 0 || cubeY == 0 || cubeZ == 0 || cubeX == chunkCubesSideX - 1 || cubeY == chunkCubesSideY - 1 || cubeZ == chunkCubesSideZ - 1)
+        return;
+
+    Triangle currentTriangle = triangleBuffer[id.x];
+    if (!(VertexIsZero(currentTriangle.v1) && VertexIsZero(currentTriangle.v2) && VertexIsZero(currentTriangle.v3)))
+    {
+        outputTriangleBufferExact.Append(currentTriangle);
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void CreateOutputAll(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= chunkMaxCubesSide * chunkMaxCubesSide * chunkMaxCubesSide * 5)
+        return;
+
+    uint cubeID = id.x / 5;
+    uint cubeX = cubeID % chunkMaxCubesSide;
+    uint cubeY = (cubeID % (chunkMaxCubesSide * chunkMaxCubesSide)) / chunkMaxCubesSide;
+    uint cubeZ = cubeID / (chunkMaxCubesSide * chunkMaxCubesSide);
+
+    if (cubeX == 0 || cubeY == 0 || cubeZ == 0 || cubeX == chunkCubesSideX - 1 || cubeY == chunkCubesSideY - 1 || cubeZ == chunkCubesSideZ - 1)
+        return;
+
+    uint newID = (cubeX - 1) + (cubeY - 1) * chunkMaxCubesSide + (cubeZ - 1) * chunkMaxCubesSide * chunkMaxCubesSide;
+    outputTriangleBufferAll[newID] = triangleBuffer[id.x];
+}
+*/

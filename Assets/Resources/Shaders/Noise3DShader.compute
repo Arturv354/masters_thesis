@@ -1,0 +1,61 @@
+#include "PerlinNoise3D.compute"
+
+#pragma kernel CSMain
+
+struct Point
+{
+	uint x;
+    uint y;
+    uint z;
+	float noiseValue;
+};
+
+RWStructuredBuffer<Point> pointsBuffer;
+
+float cubeSize;
+float terrainSizeX;
+float terrainSizeY;
+float terrainSizeZ;
+uint noiseLayers;
+float noiseDensity;
+float noiseStrength;
+float noiseLayerFrequencyMultiplier;
+float densityNoiseHighDensity;
+float densityNoiseHighStrenth;
+float densityNoiseLowDensity;
+float densityNoiselowStrenth;
+uint noiseType;
+
+[numthreads(1024,1,1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    Point pointStruct = pointsBuffer[id.x];
+
+    float densityInputX = (pointStruct.x * cubeSize - 0.5 * terrainSizeX) / terrainSizeX;
+    float densityInputY = (pointStruct.y * cubeSize - 0.5 * terrainSizeY) / terrainSizeY;
+    float densityInputZ = (pointStruct.z * cubeSize - 0.5 * terrainSizeZ) / terrainSizeZ;
+
+    float3 densityInput = float3(densityInputX, densityInputY, densityInputZ);
+
+    float densityNoiseHigh = 0;
+    float densityNoiseLow = 0;
+
+    densityNoiseHigh = pnoise(densityInput * densityNoiseHighDensity) * densityNoiseHighStrenth;
+    densityNoiseLow = pnoise(densityInput * densityNoiseLowDensity) * densityNoiselowStrenth;
+
+    densityInput += float3(densityNoiseHigh, densityNoiseHigh, densityNoiseHigh);
+    densityInput += float3(densityNoiseLow, densityNoiseLow, densityNoiseLow);
+
+    float noiseValue = 0;
+
+    for (uint i = 0; i < noiseLayers; i++)
+    {
+        float currentNoiseDensity = noiseDensity * pow(abs(noiseLayerFrequencyMultiplier), i);
+        float currentNoiseStrength = noiseStrength / pow(2, i);
+
+        noiseValue += pnoise(densityInput * currentNoiseDensity) * currentNoiseStrength;
+    }
+
+    pointStruct.noiseValue = noiseValue;
+    pointsBuffer[id.x] = pointStruct;
+}
