@@ -1,4 +1,0 @@
-repository "Magisterka@Hexagonal_Adventures@cloud"
-  path "/"
-    br "/main"
-    co "/main"
